@@ -1,122 +1,160 @@
-"""Compatibility with the Candela's legacy notification attribute layout."""
+"""Subscribe to the Candela's replies when its GATT table has no CCCD."""
 
+import asyncio
 import logging
+from collections.abc import Callable
 
+from aioesphomeapi import APIConnectionError, BluetoothProxyFeature
 from bleak import BleakClient, BleakError
 from bleak.backends.characteristic import BleakGATTCharacteristic
-from bleak.backends.descriptor import BleakGATTDescriptor
 from bleak_esphome.backend.client import ESPHomeClient
 
 CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 USER_DESCRIPTION_UUID = "00002901-0000-1000-8000-00805f9b34fb"
+NOTIFY_UUID = "8f65073d-9f57-4aaa-afea-397d19d5bbeb"
 _LOGGER = logging.getLogger(__name__)
 
 
-def _layout(characteristic: BleakGATTCharacteristic) -> str:
-    """Include discovered handles in normal warnings, not only debug logs."""
-    descriptors = ", ".join(
-        f"{descriptor.handle}:{descriptor.uuid}"
-        for descriptor in characteristic.descriptors
-    )
-    return f"notify handle={characteristic.handle}, descriptors=[{descriptors}]"
-
-
-async def _read_descriptor(
+async def start_notifications(
     client: BleakClient,
     characteristic: BleakGATTCharacteristic,
-    descriptor: BleakGATTDescriptor,
-) -> bytes:
-    """Preserve the layout when a probe fails; the caller bounds its duration."""
-    try:
-        return bytes(await client.read_gatt_descriptor(descriptor))
-    except (BleakError, TimeoutError, OSError) as err:
-        raise BleakError(
-            f"Could not inspect Candela descriptor {descriptor.handle}: {err} "
-            f"({_layout(characteristic)})"
-        ) from err
+    callback: Callable[[BleakGATTCharacteristic, bytearray], None],
+    *,
+    timeout: float,
+    trace: Callable[[str], None],
+) -> str:
+    """Keep standard subscriptions intact; recognize the observed Candela layout.
 
-
-async def notification_characteristic(
-    client: BleakClient, characteristic: BleakGATTCharacteristic
-) -> BleakGATTCharacteristic:
-    """Correct the Candela CCCD for ESPHome without modifying cached services.
-
-    The legacy implementation (v0.11.3, enable_notifications) writes 01 00
-    to notification_handle + 1. Candela firmware can instead advertise a
-    CCCD at +2, whose value is the user description b"NOTIFY\\0". ESPHome
-    also encounters this layout with the CCCD absent from discovery.
-    A descriptor at +1 labelled as a user description is only considered
-    a mislabelled CCCD if it belongs to this characteristic and reads as
-    a two-byte configuration with no reserved bits set. This remains a
-    compatibility heuristic; actual pairing and state replies are required.
-
-    Only ESPHome uses the descriptor from the supplied characteristic when
-    subscribing. BlueZ resolves descriptors internally, so this correction
-    must not be applied there. _backend is used solely for this type check;
-    all I/O goes through Bleak's public APIs.
+    The user's lamp has value handle 34, a user description at 35 containing
+    NOTIFY, and no CCCD. Never invent a descriptor or write into that description.
+    ESPHome's v3 API can register the listener separately from a CCCD write.
+    Registration alone does not establish that the lamp will send replies.
     """
-    if not isinstance(client._backend, ESPHomeClient):
-        return characteristic
+    backend = client._backend
+    if not isinstance(backend, ESPHomeClient) or characteristic.get_descriptor(
+        CCCD_UUID
+    ):
+        trace("notification mode=standard")
+        await client.start_notify(characteristic, callback)
+        return "standard"
 
-    descriptor = characteristic.get_descriptor(CCCD_UUID)
-    handle = characteristic.handle + 1
-    if descriptor is not None:
-        if descriptor.handle != handle + 1:
-            return characteristic
-        value = await _read_descriptor(client, characteristic, descriptor)
-        if value.rstrip(b"\0") != b"NOTIFY":
-            return characteristic
-
-    # Never overwrite a discovered characteristic or unrelated descriptor.
-    if client.services.get_characteristic(handle) is not None:
+    description = characteristic.get_descriptor(USER_DESCRIPTION_UUID)
+    if (
+        characteristic.uuid != NOTIFY_UUID
+        or "notify" not in characteristic.properties
+        or description is None
+        or description.characteristic_handle != characteristic.handle
+        or description.handle != characteristic.handle + 1
+    ):
         raise BleakError(
-            f"Candela notification configuration handle {handle} is occupied "
-            f"({_layout(characteristic)})"
+            "Unsupported Candela notification layout: no CCCD or NOTIFY description"
         )
-    existing = client.services.get_descriptor(handle)
-    if existing is not None:
-        if existing.characteristic_handle != characteristic.handle:
-            raise BleakError(
-                f"Candela descriptor {handle}:{existing.uuid} belongs to "
-                f"characteristic {existing.characteristic_handle} "
-                f"({_layout(characteristic)})"
-            )
-        if existing.uuid != CCCD_UUID:
-            if existing.uuid != USER_DESCRIPTION_UUID:
-                raise BleakError(
-                    f"Unsupported Candela descriptor {handle}:{existing.uuid} "
-                    f"({_layout(characteristic)})"
-                )
-            value = await _read_descriptor(client, characteristic, existing)
-            if len(value) != 2 or int.from_bytes(value, "little") & ~0x0003:
-                raise BleakError(
-                    f"Candela notification configuration descriptor is missing: "
-                    f"{handle}:{existing.uuid} has value={value[:32].hex()} "
-                    f"({_layout(characteristic)})"
-                )
+    value = bytes(await client.read_gatt_descriptor(description))
+    trace(
+        f"descriptor {description.handle}:{description.uuid} value={value[:32].hex()}"
+    )
+    if value.rstrip(b"\0") != b"NOTIFY":
+        raise BleakError("Unsupported Candela notification description")
+    if not backend._feature_flags & BluetoothProxyFeature.REMOTE_CACHING.value:
+        raise BleakError(
+            "Candela notification listener requires ESPHome v3 connections"
+        )
+
+    trace("notification mode=esphome-listener-without-cccd")
+    await _start_proxy_listener(client, backend, characteristic, callback, timeout)
+    trace("ESPHome acknowledged notification listener")
+    return "esphome-listener-without-cccd"
+
+
+async def _start_proxy_listener(
+    client: BleakClient,
+    backend: ESPHomeClient,
+    characteristic: BleakGATTCharacteristic,
+    callback: Callable[[BleakGATTCharacteristic, bytearray], None],
+    timeout: float,
+) -> None:
+    """Use HA's existing API connection and the backend's notification cleanup.
+
+    The private accesses are isolated here: backend API client, address, and
+    cancellation registry. This matches bleak-esphome 4.0.0's start/stop_notify
+    ownership, omitting only its CCCD write. No second proxy connection is opened.
+    """
+    handle = characteristic.handle
+    if not client.is_connected:
+        raise BleakError("Candela disconnected before notification registration")
+    if handle in backend._notify_cancels:
+        raise BleakError(
+            f"Candela notifications already registered for handle {handle}"
+        )
+    api = backend._client
+    address = backend._address_as_int
+    active = True
+
+    def receive(received_handle: int, data: bytearray) -> None:
+        if active and received_handle == handle and client.is_connected:
+            callback(characteristic, data)
+
+    # aioesphomeapi 46.2.0 removes its in-progress callback on Exception, but
+    # not CancelledError. Let its own bounded timeout finish registration,
+    # then clean up before returning ownership to a reconnect. An abandoned
+    # registration could otherwise overwrite the next connection's callback.
+    pending = asyncio.create_task(
+        api.bluetooth_gatt_start_notify(address, handle, receive, timeout),
+        name=f"Candela notification registration {address}:{handle}",
+    )
+
+    def discard_registration(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            _, remove = task.result()
+        except Exception:
             _LOGGER.debug(
-                "Candela: Trying descriptor %s as a mislabelled notification "
-                "configuration (uuid=%s, value=%s)",
-                handle,
-                existing.uuid,
-                value.hex(),
+                "Candela: Abandoned notification registration failed", exc_info=True
+            )
+            return  # The API removed its callback on this failed registration.
+        remove()
+        try:
+            api.bluetooth_gatt_stop_notify(address, handle)
+        except APIConnectionError:
+            _LOGGER.debug(
+                "Candela: Proxy disconnected during notification cleanup", exc_info=True
             )
 
-    service = client.services.get_service(characteristic.service_uuid)
-    if service is None:
-        raise BleakError("Candela notification service is missing")
-    corrected = BleakGATTCharacteristic(
-        characteristic.obj,
-        characteristic.handle,
-        characteristic.uuid,
-        characteristic.properties,
-        lambda: characteristic.max_write_without_response_size,
-        service,
-    )
-    corrected.add_descriptor(BleakGATTDescriptor(None, handle, CCCD_UUID, corrected))
-    _LOGGER.debug(
-        "Candela: Using notification configuration handle %s (%s)",
-        handle,
-        _layout(characteristic),
-    )
-    return corrected
+    try:
+        stop, remove = await asyncio.shield(pending)
+        if not client.is_connected:
+            raise BleakError("Candela disconnected during notification registration")
+
+        async def stop_listener() -> None:
+            nonlocal active
+            active = False
+            await stop()
+
+        def remove_listener() -> None:
+            nonlocal active
+            active = False
+            remove()
+
+        backend._notify_cancels[handle] = (stop_listener, remove_listener)
+    except BaseException as err:
+        active = False
+        # Drain the API's bounded request before the caller disconnects or
+        # reconnects. Keep shielding it if unload cancellation arrives again.
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                _LOGGER.debug(
+                    "Candela: Notification registration ended during cleanup",
+                    exc_info=True,
+                )
+                break
+        discard_registration(pending)
+        if isinstance(err, APIConnectionError):
+            raise BleakError(
+                f"ESPHome notification registration failed: {err}"
+            ) from err
+        raise

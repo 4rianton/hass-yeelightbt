@@ -6,12 +6,11 @@ from unittest.mock import Mock
 
 import pytest
 from bleak import BleakError
-from bleak.backends.descriptor import BleakGATTDescriptor
 from bleak.backends.device import BLEDevice
 from conftest import FakeClient
 
 from custom_components.yeelight_bt import yeelightbt as protocol
-from custom_components.yeelight_bt.candela import CCCD_UUID, USER_DESCRIPTION_UUID
+from custom_components.yeelight_bt.candela import CCCD_UUID
 
 pytestmark = pytest.mark.asyncio
 
@@ -64,22 +63,109 @@ async def test_missing_characteristic_disconnects(device, connect_peer):
     peer.disconnect.assert_awaited_once()
 
 
-async def test_text_descriptor_conflict_disconnects_before_pairing(
-    device, connect_peer
+async def test_observed_layout_pairs_and_updates_from_real_api_callback(
+    device, connect_peer, observed_peer
 ):
-    peer = FakeClient()
-    notify = peer.services.get_characteristic(protocol.NOTIFY_UUID)
-    peer.services.add_descriptor(
-        BleakGATTDescriptor(None, notify.handle + 1, USER_DESCRIPTION_UUID, notify)
-    )
+    peer = observed_peer.peer
     connect_peer(peer)
     lamp = protocol.Lamp(device)
-    with pytest.raises(BleakError, match="value=4e4f5449465900"):
+    await lamp.connect()
+    assert lamp.available and lamp.brightness == 40
+    peer.brightness = 72
+    peer.emit_state()
+    assert lamp.brightness == 72
+    peer.read_gatt_char.assert_not_awaited()
+    await lamp.close()
+    assert not observed_peer.api._notify_callbacks
+    assert not lamp.available
+    peer.disconnect.assert_awaited_once()
+
+
+@pytest.mark.parametrize("phase", ["pairing", "waiting for state"])
+async def test_reply_timeout_has_complete_report_and_releases_listener(
+    device, connect_peer, observed_peer, phase
+):
+    peer = observed_peer.peer
+    if phase == "pairing":
+        peer.pair_result = None
+    else:
+        peer.reply_to_state = False
+    connect_peer(peer)
+    lamp = protocol.Lamp(device)
+    with pytest.raises(BleakError) as exc:
+        await lamp.connect()
+    report = str(exc.value)
+    assert "version=1.4.4" in report
+    assert f"phase={phase}" in report
+    assert "mode=esphome-listener-without-cccd" in report
+    assert "backend=ESPHomeClient" in report
+    assert "proxy=test proxy" in report
+    assert "35:00002901-0000-1000-8000-00805f9b34fb" in report
+    assert "value=4e4f5449465900" in report
+    assert "value=436702" in report
+    assert "diagnostic read handle=34 len=18 value=43ff" in report
+    if phase == "waiting for state":
+        assert "RX handle=34 len=18 value=436304" in report
+    assert not lamp.available
+    peer.disconnect.assert_awaited_once()
+    observed_peer.remove.assert_called_once()
+    assert not observed_peer.api._notify_callbacks
+
+
+async def test_failure_probe_is_bounded_and_cannot_confirm_state(
+    device, connect_peer, observed_peer
+):
+    peer = observed_peer.peer
+    peer.pair_result = None
+
+    async def wait_for_read(*args):
+        await asyncio.Event().wait()
+
+    peer.read_gatt_char.side_effect = wait_for_read
+    connect_peer(peer)
+    lamp = protocol.Lamp(device)
+    with pytest.raises(BleakError, match="diagnostic read failed: TimeoutError"):
         await lamp.connect()
     assert not lamp.available
-    assert peer.writes == []
-    assert peer.notify_callback is None
     peer.disconnect.assert_awaited_once()
+    assert not observed_peer.api._notify_callbacks
+
+
+async def test_cancel_during_failure_probe_releases_connection(
+    device, connect_peer, observed_peer
+):
+    peer = observed_peer.peer
+    peer.pair_result = None
+    reading = asyncio.Event()
+
+    async def wait_for_read(*args):
+        reading.set()
+        await asyncio.Event().wait()
+
+    peer.read_gatt_char.side_effect = wait_for_read
+    connect_peer(peer)
+    lamp = protocol.Lamp(device)
+    pending = asyncio.create_task(lamp.connect())
+    await reading.wait()
+    await lamp.close()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    peer.disconnect.assert_awaited_once()
+    assert not observed_peer.api._notify_callbacks
+
+
+async def test_diagnostic_reads_are_not_treated_as_live_state(
+    device, connect_peer, observed_peer
+):
+    peer = observed_peer.peer
+    peer.pair_result = None
+    peer.read_gatt_char.return_value = bytes([0x43, 0x45, 1, 99]) + bytes(14)
+    connect_peer(peer)
+    lamp = protocol.Lamp(device)
+    with pytest.raises(BleakError, match="diagnostic read handle=34"):
+        await lamp.connect()
+    assert not lamp.available
+    assert lamp.brightness == 0
 
 
 async def test_concurrent_operations_connect_once(device, connect_peer):

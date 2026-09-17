@@ -1,8 +1,10 @@
 """Use real Home Assistant 2026.9 entities and config entry APIs."""
 
 import asyncio
+import json
 import logging
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -15,7 +17,7 @@ from homeassistant.helpers.entity_platform import EntityPlatform
 
 from custom_components import yeelight_bt as integration
 from custom_components.yeelight_bt.config_flow import Yeelight_btConfigFlow
-from custom_components.yeelight_bt.const import DOMAIN
+from custom_components.yeelight_bt.const import DOMAIN, VERSION
 from custom_components.yeelight_bt.light import YeelightBT
 from custom_components.yeelight_bt.yeelightbt import (
     CMD_BRIGHTNESS,
@@ -78,6 +80,41 @@ async def test_service_failure_is_not_reported_as_success(hass, device, connect_
     assert entity.brightness == 102
     assert hass.states.get(entity.entity_id).state == "unavailable"
     await entity.async_will_remove_from_hass()
+
+
+async def test_failed_attempt_logs_diagnostics_at_warning_level(
+    device, connect_peer, observed_peer, caplog
+):
+    peer = observed_peer.peer
+    peer.pair_result = None
+    connector = connect_peer(peer)
+    entity = YeelightBT("Candela", device)
+    with caplog.at_level(logging.WARNING):
+        await entity.async_update()
+        report = caplog.records[-1].getMessage()
+        assert "Could not update lamp" in report
+        assert "Yeelight diagnostics: version=1.4.4" in report
+        assert "phase=pairing" in report
+        assert "notifications=0" in report
+        assert "diagnostic read handle=34" in report
+        before = len(caplog.records)
+        await entity.async_update()  # Cooldown must not repeat the warning.
+        assert len(caplog.records) == before
+        assert connector.await_count == 1
+        # A new actual failure must still report its new reason and stage.
+        entity._dev._retry_at = 0
+        replacement = FakeClient()
+        replacement.pair_result = 3
+        connect_peer(replacement)
+        await entity.async_update()
+        assert len(caplog.records) == before + 1
+        assert "rejected" in caplog.records[-1].getMessage()
+    await entity._dev.close()
+
+
+async def test_diagnostic_version_matches_manifest():
+    manifest = Path(integration.__file__).with_name("manifest.json")
+    assert json.loads(manifest.read_text())["version"] == VERSION
 
 
 async def test_low_brightness_is_not_rounded_to_off(device, connect_peer):

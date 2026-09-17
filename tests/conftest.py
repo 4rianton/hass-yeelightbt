@@ -1,9 +1,13 @@
 """In-memory GATT peer; no test opens a Bluetooth connection."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import pytest_asyncio
+from aioesphomeapi import APIClient, BluetoothProxyFeature
+from aioesphomeapi.api_pb2 import BluetoothGATTNotifyDataResponse
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.descriptor import BleakGATTDescriptor
 from bleak.backends.device import BLEDevice
@@ -11,7 +15,7 @@ from bleak.backends.service import BleakGATTService, BleakGATTServiceCollection
 from bleak_esphome.backend.client import ESPHomeClient
 
 from custom_components.yeelight_bt import yeelightbt as protocol
-from custom_components.yeelight_bt.candela import CCCD_UUID
+from custom_components.yeelight_bt.candela import CCCD_UUID, USER_DESCRIPTION_UUID
 
 
 @pytest.fixture
@@ -19,7 +23,7 @@ def device():
     return BLEDevice("AA:BB:CC:DD:EE:FF", "yeelight_ms", {"source": "proxy"})
 
 
-def make_services(cccd=35):
+def make_services(cccd=34, notify_handle=33):
     services = BleakGATTServiceCollection()
     service = BleakGATTService(None, 29, "8e2f0cbd-1a66-4b53-ace6-b494e25f87bd")
     services.add_service(service)
@@ -27,7 +31,12 @@ def make_services(cccd=35):
         None, 30, protocol.CONTROL_UUID, ["write"], lambda: 20, service
     )
     notify = BleakGATTCharacteristic(
-        None, 33, protocol.NOTIFY_UUID, ["read", "notify"], lambda: 20, service
+        None,
+        notify_handle,
+        protocol.NOTIFY_UUID,
+        ["read", "notify"],
+        lambda: 20,
+        service,
     )
     services.add_characteristic(control)
     services.add_characteristic(notify)
@@ -56,6 +65,13 @@ class FakeClient:
             self._backend._cancel_connection_state = None
             self._backend._loop = Mock()
             self._backend._loop.is_closed.return_value = True
+            self._backend._notify_cancels = {}
+            self._backend._is_connected = True
+            self._backend._feature_flags = BluetoothProxyFeature.REMOTE_CACHING.value
+            self._backend._address_as_int = 123
+            self._backend._description = "test proxy"
+            self._backend._disconnect_callbacks = set()
+            self._backend._bluetooth_device = Mock()
         self.is_connected = True
         self.notify_callback = None
         self.disconnected_callback = None
@@ -68,6 +84,7 @@ class FakeClient:
         self.fail_command = None
         self.writes = []
         self.read_gatt_descriptor = AsyncMock(return_value=b"NOTIFY\0")
+        self.read_gatt_char = AsyncMock(return_value=b"\x43\xff" + bytes(16))
         self.disconnect = AsyncMock(side_effect=self._disconnect)
         self.block_write = None
         self.write_entered = asyncio.Event()
@@ -87,10 +104,14 @@ class FakeClient:
 
     def drop(self):
         self.is_connected = False
+        if isinstance(self._backend, ESPHomeClient):
+            self._backend._async_disconnected_cleanup()
         self.disconnected_callback(self)
 
     async def _disconnect(self):
         self.is_connected = False
+        if isinstance(self._backend, ESPHomeClient):
+            self._backend._async_disconnected_cleanup()
         if self.disconnected_callback:
             self.disconnected_callback(self)
 
@@ -132,6 +153,7 @@ def fast_protocol(monkeypatch):
         "STATE_TIMEOUT",
         "CONNECT_TIMEOUT",
         "DISCONNECT_TIMEOUT",
+        "DIAGNOSTIC_TIMEOUT",
     ):
         monkeypatch.setattr(protocol, key, 0.05)
     monkeypatch.setattr(protocol, "RETRY_DELAY", 0)
@@ -157,3 +179,34 @@ def connect_peer(monkeypatch, fast_protocol):
         return connector
 
     return configure
+
+
+@pytest_asyncio.fixture
+async def observed_peer():
+    """The user's exact layout, with real ESPHome API callback registration.
+
+    Only the API network send and receive boundary is mocked. All API callback
+    ownership and the ESPHome backend's disconnect cleanup are real methods.
+    """
+    peer = FakeClient()
+    peer.services = make_services(None, notify_handle=34)
+    notify = peer.services.get_characteristic(protocol.NOTIFY_UUID)
+    peer.services.add_descriptor(
+        BleakGATTDescriptor(None, 35, USER_DESCRIPTION_UUID, notify)
+    )
+    api = APIClient("test-proxy.local", 6053)
+    connection = Mock()
+    remove = connection.add_message_callback.return_value
+    api._get_connection = Mock(return_value=connection)
+    api._send_bluetooth_message_await_response = AsyncMock()
+    api.bluetooth_gatt_stop_notify = Mock(wraps=api.bluetooth_gatt_stop_notify)
+    peer._backend._client = api
+
+    def emit(data):
+        handler = connection.add_message_callback.call_args.args[0]
+        handler(
+            BluetoothGATTNotifyDataResponse(address=123, handle=34, data=bytes(data))
+        )
+
+    peer.emit = emit
+    return SimpleNamespace(peer=peer, api=api, connection=connection, remove=remove)

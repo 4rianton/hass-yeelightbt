@@ -5,10 +5,15 @@
 > See [the implementation review](docs/STABILITY_REVIEW.md) for the protocol,
 > defects, changes, and remaining hardware validation. It retains actual state
 > feedback; it does not assume successful pairing or replace feedback with the
-> last requested state. The first physical installation failed on a descriptor
-> conflict; version 1.4.3 adds descriptor inspection and detailed error reporting.
+> last requested state. Version 1.4.4 handles the reported missing notification
+> configuration descriptor by registering the ESPHome listener without a descriptor
+> write. Failed attempts include detailed diagnostics at normal warning level.
 > Successful control on that Candela remains unverified. Local BlueZ Candela
 > compatibility remains limited.
+>
+> If a failure occurs, copy the full Yeelight warning from Home Assistant logs,
+> including `Yeelight diagnostics`, `Route`, `GATT`, and `Recent activity`.
+> Debug logging is not required.
 >
 > The release/install notes below describe historical published versions.
 

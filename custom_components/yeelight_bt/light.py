@@ -28,7 +28,13 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.color import color_hs_to_RGB, color_RGB_to_hs
 
 from .const import DOMAIN
-from .yeelightbt import MODEL_CANDELA, TRANSPORT_ERRORS, Lamp, model_from_name
+from .yeelightbt import (
+    MODEL_CANDELA,
+    TRANSPORT_ERRORS,
+    Lamp,
+    ReconnectDeferred,
+    model_from_name,
+)
 
 _LOGGER = logging.getLogger(__name__)
 # Each lamp has its own lock; one unreachable lamp must not block another.
@@ -158,11 +164,10 @@ class YeelightBT(LightEntity):
                 return
             try:
                 await self._dev.get_state()
+            except ReconnectDeferred as err:
+                _LOGGER.debug("%s: %s", self.name, err)
             except TRANSPORT_ERRORS as err:
-                if not self._update_failed:
-                    _LOGGER.warning("%s: Could not update lamp: %s", self.name, err)
-                else:
-                    _LOGGER.debug("%s: Update still failing: %s", self.name, err)
+                _LOGGER.warning("%s: Could not update lamp: %s", self.name, err)
                 self._update_failed = True
             else:
                 if self._update_failed:

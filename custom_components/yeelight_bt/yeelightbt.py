@@ -10,6 +10,7 @@ import asyncio
 import enum
 import logging
 import struct
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -20,9 +21,9 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak_retry_connector import establish_connection
 
-from .candela import notification_characteristic
+from .candela import NOTIFY_UUID, start_notifications
+from .const import VERSION
 
-NOTIFY_UUID = "8f65073d-9f57-4aaa-afea-397d19d5bbeb"
 CONTROL_UUID = "aa7d3f34-2d4f-41e0-807f-52fbf8cf7443"
 COMMAND_STX = 0x43
 CMD_PAIR = 0x67
@@ -53,6 +54,7 @@ GATT_TIMEOUT = 10.0
 PAIR_TIMEOUT = 15.0
 STATE_TIMEOUT = 5.0
 DISCONNECT_TIMEOUT = 5.0
+DIAGNOSTIC_TIMEOUT = 2.0
 COMMAND_SETTLE_TIME = 0.5
 TRANSITION_SETTLE_TIME = 0.7
 RETRY_DELAY = 0.5
@@ -67,6 +69,10 @@ class Conn(enum.Enum):
     UNPAIRED = 2
     PAIRING = 3
     PAIRED = 4
+
+
+class ReconnectDeferred(BleakError):
+    """A scheduled cooldown, rather than a new failed connection attempt."""
 
 
 def model_from_name(ble_name: str | None) -> str:
@@ -113,6 +119,7 @@ class Lamp:
         self._model = model or model_from_name(ble_device.name)
         self._client: BleakClient | None = None
         self._control: BleakGATTCharacteristic | None = None
+        self._notify: BleakGATTCharacteristic | None = None
         self._write_response = True
         self._conn = Conn.DISCONNECTED
         self._operation_lock = asyncio.Lock()
@@ -131,6 +138,80 @@ class Lamp:
         self.versions: tuple[int, ...] | None = None
         self.serial: int | None = None
         self._state_callbacks: list[Callable[[], None]] = []
+        self._phase = "idle"
+        self._attempt = 0
+        self._attempt_started = 0.0
+        self._trace: deque[str] = deque(maxlen=20)
+        self._received_count = 0
+        self._response_timeout = False
+        self._notification_mode = "not subscribed"
+        self._gatt_details = "not discovered"
+        self._route_details = "not connected"
+
+    def _record(self, event: str) -> None:
+        elapsed = asyncio.get_running_loop().time() - self._attempt_started
+        self._trace.append(f"{elapsed:.3f}s {event}")
+        _LOGGER.debug("%s: %s", self._mac, event)
+
+    def _describe_route(self) -> None:
+        """Describe the selected backend without dumping proxy credentials."""
+        backend = self._client._backend
+        details = self._ble_device.details
+        source = (
+            details.get("source", "local") if isinstance(details, dict) else "local"
+        )
+        source = getattr(backend, "_source", source)
+        proxy = getattr(backend, "_description", "unknown")
+        info = getattr(backend, "_device_info", None)
+        firmware = getattr(info, "esphome_version", "unknown")
+        self._route_details = (
+            f"backend={type(backend).__name__}, source={source}, "
+            f"proxy={proxy}, firmware={firmware}"
+        )
+
+    def _describe_connection(self) -> None:
+        """Snapshot GATT metadata while connected; it may be cleared on a drop."""
+        self._describe_route()
+        characteristics = list(self._client.services.characteristics.values())
+        self._gatt_details = "; ".join(
+            f"{char.handle}:{char.uuid} properties={','.join(char.properties)} "
+            f"descriptors=[{','.join(f'{desc.handle}:{desc.uuid}' for desc in char.descriptors[:8])}]"
+            for char in characteristics[:32]
+        )
+
+    async def _failure_report(self) -> str:
+        """Capture one bounded report, including a read only after reply timeouts."""
+        if (
+            self._client is not None
+            and getattr(self._client, "_backend", None) is not None
+        ):
+            self._describe_route()
+        if (
+            self._response_timeout
+            and self._client is not None
+            and self._client.is_connected
+            and self._notify is not None
+            and "read" in self._notify.properties
+        ):
+            try:
+                async with asyncio.timeout(DIAGNOSTIC_TIMEOUT):
+                    value = bytes(await self._client.read_gatt_char(self._notify))
+                self._record(
+                    f"diagnostic read handle={self._notify.handle} len={len(value)} value={value[:32].hex()}"
+                )
+            except Exception as err:
+                _LOGGER.debug(
+                    "%s: Failure diagnostic read failed", self._mac, exc_info=True
+                )
+                self._record(f"diagnostic read failed: {type(err).__name__}: {err}")
+        return (
+            f"Yeelight diagnostics: version={VERSION}, attempt={self._attempt}, "
+            f"model={self._model}, phase={self._phase}, state={self._conn.name}, "
+            f"notifications={self._received_count}, mode={self._notification_mode}, "
+            f"write_response={self._write_response}\n"
+            f"Route: {self._route_details}\nGATT: {self._gatt_details}\n"
+            f"Recent activity: {'; '.join(self._trace)}"
+        )
 
     def add_callback_on_state_changed(
         self, func: Callable[[], None]
@@ -150,6 +231,7 @@ class Lamp:
         if client is not self._client:
             return
         _LOGGER.debug("%s: Bluetooth disconnected", self._mac)
+        self._record("Bluetooth disconnected")
         self._conn = Conn.DISCONNECTED
         self._has_state = False
         # Wake pending requests; they check connection state before returning.
@@ -164,21 +246,42 @@ class Lamp:
                 raise BleakError("Yeelight connection is shutting down")
             remaining = self._retry_at - asyncio.get_running_loop().time()
             if remaining > 0:
-                raise BleakError(
+                raise ReconnectDeferred(
                     f"Yeelight reconnect paused for {remaining:.0f}s after a failure"
                 )
             self._active_task = asyncio.current_task()
+            self._attempt += 1
+            self._attempt_started = asyncio.get_running_loop().time()
+            self._trace.clear()
+            self._received_count = 0
+            self._response_timeout = False
+            self._phase = "starting"
             try:
                 yield
             except asyncio.CancelledError:
                 await self._disconnect()
                 raise
-            except Exception:
+            except Exception as err:
+                try:
+                    report = await self._failure_report()
+                except asyncio.CancelledError:
+                    await self._disconnect()
+                    raise
+                except Exception as diagnostic_error:
+                    _LOGGER.debug(
+                        "%s: Could not collect failure diagnostics",
+                        self._mac,
+                        exc_info=True,
+                    )
+                    report = f"Yeelight diagnostics could not be collected: {diagnostic_error}"
                 await self._disconnect()
                 self._failures = min(self._failures + 1, 5)
                 self._retry_at = asyncio.get_running_loop().time() + min(
                     BACKOFF_MAX, BACKOFF_BASE * 2 ** (self._failures - 1)
                 )
+                if isinstance(err, TRANSPORT_ERRORS):
+                    raise BleakError(f"{err}\n{report}") from err
+                _LOGGER.exception("%s: Unexpected lamp failure\n%s", self._mac, report)
                 raise
             else:
                 self._failures = 0
@@ -195,6 +298,10 @@ class Lamp:
         if self.available:
             return
         await self._disconnect()
+        self._phase = "finding route"
+        self._gatt_details = "not discovered"
+        self._route_details = "not connected"
+        self._notification_mode = "not subscribed"
         if self._device_callback is not None:
             device = self._device_callback()
             if device is None:
@@ -206,6 +313,7 @@ class Lamp:
             raise BleakError(f"Unknown Yeelight model for {self._mac}")
 
         _LOGGER.debug("%s: Connecting to %s", self._mac, self._model)
+        self._phase = "connecting"
         try:
             async with asyncio.timeout(CONNECT_TIMEOUT):
                 client = await establish_connection(
@@ -221,10 +329,13 @@ class Lamp:
                 "Timed out establishing the Yeelight BLE connection"
             ) from err
         self._client = client
+        self._phase = "discovering services"
+        self._describe_connection()
         self._conn = Conn.UNPAIRED
         self._has_state = False
         self._control = client.services.get_characteristic(CONTROL_UUID)
         notify = client.services.get_characteristic(NOTIFY_UUID)
+        self._notify = notify
         if self._control is None or notify is None:
             raise BleakError(
                 "Yeelight control or notification characteristic is missing"
@@ -238,27 +349,39 @@ class Lamp:
             raise BleakError("Yeelight control characteristic is not writable")
 
         try:
+            self._phase = "subscribing"
             async with asyncio.timeout(GATT_TIMEOUT):
-                if self._model == MODEL_CANDELA:
-                    notify = await notification_characteristic(client, notify)
-                await client.start_notify(
-                    notify,
-                    lambda sender, data: self._notification_from(client, sender, data),
+                callback = lambda sender, data: self._notification_from(
+                    client, sender, data
                 )
+                if self._model == MODEL_CANDELA:
+                    self._notification_mode = await start_notifications(
+                        client,
+                        notify,
+                        callback,
+                        timeout=GATT_TIMEOUT,
+                        trace=self._record,
+                    )
+                else:
+                    await client.start_notify(notify, callback)
+                    self._notification_mode = "standard"
         except TimeoutError as err:
             raise BleakError("Timed out subscribing to Yeelight notifications") from err
         await self._pair()
         await self._request_state()
         _LOGGER.debug("%s: Paired and state confirmed", self._mac)
+        self._record("Pairing and state confirmed")
 
     async def _pair(self) -> None:
         self._pair_resp_event.clear()
         self._conn = Conn.PAIRING
         await self._write(struct.pack("BBB15x", COMMAND_STX, CMD_PAIR, CMD_PAIR_ON))
+        self._phase = "pairing"
         try:
             async with asyncio.timeout(PAIR_TIMEOUT):
                 await self._pair_resp_event.wait()
         except TimeoutError as err:
+            self._response_timeout = True
             raise BleakError(
                 "Timed out waiting for Yeelight pairing confirmation"
             ) from err
@@ -274,11 +397,14 @@ class Lamp:
         if client is None or not client.is_connected or self._control is None:
             raise BleakError("Yeelight is disconnected")
         _LOGGER.debug("%s: Sending %s", self._mac, bits.hex())
+        self._phase = f"writing 0x{bits[1]:02x}"
+        self._record(f"TX handle={self._control.handle} value={bits.hex()}")
         try:
             async with asyncio.timeout(GATT_TIMEOUT):
                 await client.write_gatt_char(
                     self._control, bits, response=self._write_response
                 )
+            self._record("GATT write completed")
         except TimeoutError as err:
             raise BleakError(
                 f"Timed out writing Yeelight command 0x{bits[1]:02x}"
@@ -289,10 +415,12 @@ class Lamp:
         await self._write(
             struct.pack("BBB15x", COMMAND_STX, CMD_GETSTATE, CMD_GETSTATE_SEC)
         )
+        self._phase = "waiting for state"
         try:
             async with asyncio.timeout(STATE_TIMEOUT):
                 await self._state_event.wait()
         except TimeoutError as err:
+            self._response_timeout = True
             raise BleakError(
                 "Timed out waiting for a Yeelight state notification"
             ) from err
@@ -302,6 +430,7 @@ class Lamp:
     async def _disconnect(self) -> None:
         client, self._client = self._client, None
         self._control = None
+        self._notify = None
         changed = self._conn != Conn.DISCONNECTED or self._has_state
         self._conn = Conn.DISCONNECTED
         self._has_state = False
@@ -395,7 +524,8 @@ class Lamp:
                         await asyncio.sleep(wait_notif)
                         await self._request_state()
                     return True
-                except TRANSPORT_ERRORS:
+                except TRANSPORT_ERRORS as err:
+                    self._record(f"Command failed: {err}")
                     await self._disconnect()
                     if attempt:
                         raise
@@ -474,6 +604,10 @@ class Lamp:
     ) -> None:
         """Accept complete protocol frames; ignore malformed or unrelated data."""
         _LOGGER.debug("%s: Received %s", self._mac, data.hex())
+        self._received_count += 1
+        self._record(
+            f"RX handle={getattr(sender, 'handle', sender)} len={len(data)} value={data[:32].hex()}"
+        )
         if len(data) != 18 or data[0] != COMMAND_STX:
             _LOGGER.debug("%s: Ignoring invalid notification frame", self._mac)
             return

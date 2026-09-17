@@ -47,57 +47,57 @@ that occupies a slot without completing the protocol or being cleaned up.
 
 ## Candela notification compatibility
 
-This repository's `v0.11.3` implementation enables notifications by writing
-`01 00` to the notification value handle plus one. A historical
-[Candela GATT capture](https://gist.github.com/yeahwangy/c52f7608859da7ef41c58cfb7f25e567)
-shows value handle 33 but a purported configuration descriptor at 35 whose value
-is the string `NOTIFY`, rather than a two-byte configuration. The actual legacy
-enable write would target 34. Upstream reports also describe a missing descriptor
-through ESPHome. This is evidence for a device-specific attribute-layout quirk,
-not proof of the particular firmware layout on the user's lamp.
+The installed version 1.4.3 produced a concrete GATT report: notification value
+handle **34**, with a single user-description descriptor (`0x2901`) at **35**,
+containing `4e4f5449465900` (`NOTIFY\0`). No client configuration descriptor
+(`0x2902`, CCCD) was present. Earlier assumptions based on historical captures
+and backend handle numbering did not match this lamp. Writing a configuration
+value to handle 35 would overwrite a description, not enable notifications.
 
-`candela.py` corrects only the characteristic object passed to ESPHome's notification
-subscription when the configuration descriptor is missing, or when the descriptor
-at +2 reads back as `NOTIFY`. A valid descriptor is left alone. Conflicting discovered
-handles are rejected. Shared/cached service records are not modified. The existing
-public Bleak/ESPHome subscribe and unsubscribe paths still own notification forwarding
-and cleanup. The only private API access is a guarded backend type check, isolated
-in this module. No raw ESPHome API connection or firmware modification is needed.
+Version 1.4.4 recognizes this layout and registers an ESPHome notification listener
+without writing a descriptor. ESPHome 2026.9.0 separates local listener registration
+from CCCD writes; bleak-esphome normally performs both. The compatibility adapter
+uses HA's existing proxy API connection and installs cleanup callbacks in the
+backend's existing notification registry. It does not fabricate descriptors or
+modify cached service records. Unknown layouts are rejected. Lamps with a CCCD
+and local Bluetooth backends retain the standard Bleak subscription path.
 
-This targets ESPHome. BlueZ resolves notification descriptors internally and does
-not use this correction. Candela units with the malformed layout connected through
-local BlueZ may still fail. The old BlueZ-only assumption of successful pairing has
-been removed; there is no silent switch to command-only state tracking. Bedside lamps
-continue using the standard notification path.
+This adapter depends on private bleak-esphome backend fields, isolated in
+`candela.py`; dependency updates may require adapting it. Tests exercise the real
+aioesphomeapi registration and callback registry with mocked network responses.
+Cancellation waits for the API's bounded registration request to finish and cleans
+it up before allowing reconnection, preventing a late registration from replacing
+a newer listener. This can delay cancellation by the remaining registration timeout
+(up to 10 seconds).
 
-The notification correction remains a hardware validation candidate. Tests establish
-what the real ESPHome client writes and how it forwards notifications, but cannot
-establish that a particular physical lamp accepts the write.
+Listener registration is not proof of successful communication. Pairing and actual
+state notifications remain mandatory, and physical lamp changes still use received
+state frames. Whether this lamp sends those replies through the new listener path
+requires hardware validation. Local BlueZ compatibility for malformed GATT tables
+remains limited.
 
-### First hardware report and version 1.4.3
+### Failure diagnostics in version 1.4.4
 
-The first installation on the user's ESPHome proxy failed with
-`Candela notification configuration descriptor is ambiguous`. This is an error
-raised by this integration before subscribing or sending the pairing command. It
-means discovery already contains a descriptor with a different UUID at the proposed
-legacy configuration handle. The original tests omitted this layout. The message
-does not reveal the descriptor's UUID or value, so it does not establish that the
-descriptor is a usable configuration setting.
+Each failed connection or polling attempt produces a normal warning containing:
 
-Version 1.4.3 checks ownership before considering that descriptor. If it belongs to
-the notification characteristic and is labelled as a user description (`0x2901`),
-the integration reads it. A two-byte value with only notification/indication bits
-set is treated as a candidate mislabelled configuration. This is a compatibility
-heuristic, not a confirmed description of the user's firmware. The original service
-cache is left unchanged and pairing and actual state replies remain mandatory.
+- Integration version, attempt number, failing protocol phase, connection state,
+  notification count, subscription mode, and command response mode.
+- Selected proxy/backend information and firmware version when available.
+- Discovered characteristic handles, UUIDs, properties, and descriptor handles/UUIDs.
+- The last 20 timestamped protocol events, including sent commands, received replies,
+  inspected descriptor values, and disconnections.
 
-Text values such as `NOTIFY`, unknown descriptor types, and descriptors belonging
-to another characteristic are rejected without a write. Errors now include the
-notification handle, descriptor UUIDs and, when inspected, the value in hex. Read
-errors retain this layout information too. If the lamp has a text description at
-that handle, this update will identify it but will not make the lamp available.
-That layout still requires further protocol investigation. Physical validation of
-the new candidate path is outstanding.
+GATT output is capped at 32 characteristics and eight descriptors per characteristic;
+received packet and descriptor previews are capped at 32 bytes. Diagnostics do not
+dump proxy API credentials. After a pairing or state reply timeout, a readable
+notification characteristic is read once with a two-second timeout. Its value is
+logged for diagnosis only and never accepted as confirmed state. Diagnostic failure
+must not prevent connection cleanup.
+
+Cooldown polls log only at DEBUG; each subsequent real failed attempt gets a fresh
+warning, and recovery is logged. To report a failure, copy the full Yeelight warning
+from Home Assistant logs, including `Yeelight diagnostics`, `Route`, `GATT`, and
+`Recent activity`. Debug logging is not required for this report.
 
 ## Changes implemented
 
@@ -111,8 +111,8 @@ the new candidate path is outstanding.
   are errors. State comes from notification frames, including physical lamp changes.
 - GATT writes use an explicit response mode from the characteristic properties.
   Brightness/color transitions settle before the state request, under the same lock.
-- No optimistic state mutation after failed commands. Action errors reach HA; repeated
-  polling errors are reduced to debug after the first warning, with a recovery message.
+- No optimistic state mutation after failed commands. Action errors reach HA; actual failed
+  attempts include warning diagnostics, cooldown polls stay at DEBUG, and recovery is logged.
 - Candela exposes brightness-only mode; unsupported effects/transitions are removed.
   Bedside color temperature uses the Kelvin API and existing calibration mapping.
 - Shared HA discovery history, duplicate filtering, and correct unload bookkeeping.
@@ -132,7 +132,8 @@ python3 -m venv .venv-test
 
 The suite uses Home Assistant 2026.9.0 and its pinned Bluetooth libraries. Network
 and radio calls are mocked. It covers actual HA state serialization, Candela physical
-state notifications, the real ESPHome backend's corrected descriptor write, timeouts,
+state notifications, the reported descriptor layout without a CCCD write, real API
+callback registration and cleanup, late acknowledgements, warning diagnostics, timeouts,
 rejected pairing, stale callbacks, malformed packets, concurrent commands, reconnection,
 cooldowns, shutdown cancellation, discovery, Bedside behavior, and entity unloading.
 
@@ -147,6 +148,8 @@ validation are separate steps.
 - [HA 2026.9 light state validation](https://github.com/home-assistant/core/blob/2026.9.0/homeassistant/components/light/__init__.py).
 - [Bleak write and notification APIs](https://bleak.readthedocs.io/en/latest/api/client.html).
 - [ESPHome client implementation](https://github.com/Bluetooth-Devices/bleak-esphome/blob/v4.0.0/src/bleak_esphome/backend/client.py).
+- [ESPHome 2026.9.0 listener registration](https://github.com/esphome/esphome/blob/2026.9.0/esphome/components/bluetooth_connection/bluetooth_connection_bluedroid.cpp).
+- [aioesphomeapi 46.2.0 notification lifecycle](https://github.com/esphome/aioesphomeapi/blob/v46.2.0/aioesphomeapi/client.py).
 - [Legacy notification enable implementation](https://github.com/hcoohb/hass-yeelightbt/blob/v0.11.3/custom_components/yeelight_bt/yeelightbt.py).
 - [Upstream Candela/proxy proposal](https://github.com/hcoohb/hass-yeelightbt/pull/79) documents
   a command-only workaround; that approach is not used here.
