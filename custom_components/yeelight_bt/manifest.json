@@ -11,7 +11,7 @@
       "local_name": "yeelight_ms*"
     }
   ],
-  "codeowners": ["@hcoohb"],
+  "codeowners": ["@4rianton"],
   "config_flow": true,
   "dependencies": ["bluetooth"],
   "documentation": "https://github.com/hcoohb/hass-yeelightbt",
