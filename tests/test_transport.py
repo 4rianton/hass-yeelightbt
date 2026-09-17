@@ -6,11 +6,12 @@ from unittest.mock import Mock
 
 import pytest
 from bleak import BleakError
+from bleak.backends.descriptor import BleakGATTDescriptor
 from bleak.backends.device import BLEDevice
 from conftest import FakeClient
 
 from custom_components.yeelight_bt import yeelightbt as protocol
-from custom_components.yeelight_bt.candela import CCCD_UUID
+from custom_components.yeelight_bt.candela import CCCD_UUID, USER_DESCRIPTION_UUID
 
 pytestmark = pytest.mark.asyncio
 
@@ -60,6 +61,24 @@ async def test_missing_characteristic_disconnects(device, connect_peer):
     lamp = protocol.Lamp(device)
     with pytest.raises(BleakError, match="missing"):
         await lamp.connect()
+    peer.disconnect.assert_awaited_once()
+
+
+async def test_text_descriptor_conflict_disconnects_before_pairing(
+    device, connect_peer
+):
+    peer = FakeClient()
+    notify = peer.services.get_characteristic(protocol.NOTIFY_UUID)
+    peer.services.add_descriptor(
+        BleakGATTDescriptor(None, notify.handle + 1, USER_DESCRIPTION_UUID, notify)
+    )
+    connect_peer(peer)
+    lamp = protocol.Lamp(device)
+    with pytest.raises(BleakError, match="value=4e4f5449465900"):
+        await lamp.connect()
+    assert not lamp.available
+    assert peer.writes == []
+    assert peer.notify_callback is None
     peer.disconnect.assert_awaited_once()
 
 

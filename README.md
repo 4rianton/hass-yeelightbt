@@ -5,8 +5,10 @@
 > See [the implementation review](docs/STABILITY_REVIEW.md) for the protocol,
 > defects, changes, and remaining hardware validation. It retains actual state
 > feedback; it does not assume successful pairing or replace feedback with the
-> last requested state. The notification fix has not yet been tested on a physical
-> Candela. Local BlueZ Candela compatibility remains limited.
+> last requested state. The first physical installation failed on a descriptor
+> conflict; version 1.4.3 adds descriptor inspection and detailed error reporting.
+> Successful control on that Candela remains unverified. Local BlueZ Candela
+> compatibility remains limited.
 >
 > The release/install notes below describe historical published versions.
 

@@ -74,6 +74,31 @@ The notification correction remains a hardware validation candidate. Tests estab
 what the real ESPHome client writes and how it forwards notifications, but cannot
 establish that a particular physical lamp accepts the write.
 
+### First hardware report and version 1.4.3
+
+The first installation on the user's ESPHome proxy failed with
+`Candela notification configuration descriptor is ambiguous`. This is an error
+raised by this integration before subscribing or sending the pairing command. It
+means discovery already contains a descriptor with a different UUID at the proposed
+legacy configuration handle. The original tests omitted this layout. The message
+does not reveal the descriptor's UUID or value, so it does not establish that the
+descriptor is a usable configuration setting.
+
+Version 1.4.3 checks ownership before considering that descriptor. If it belongs to
+the notification characteristic and is labelled as a user description (`0x2901`),
+the integration reads it. A two-byte value with only notification/indication bits
+set is treated as a candidate mislabelled configuration. This is a compatibility
+heuristic, not a confirmed description of the user's firmware. The original service
+cache is left unchanged and pairing and actual state replies remain mandatory.
+
+Text values such as `NOTIFY`, unknown descriptor types, and descriptors belonging
+to another characteristic are rejected without a write. Errors now include the
+notification handle, descriptor UUIDs and, when inspected, the value in hex. Read
+errors retain this layout information too. If the lamp has a text description at
+that handle, this update will identify it but will not make the lamp available.
+That layout still requires further protocol investigation. Physical validation of
+the new candidate path is outstanding.
+
 ## Changes implemented
 
 - One serialized connection/command pipeline per lamp, plus serialization of complete
