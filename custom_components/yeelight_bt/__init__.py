@@ -1,4 +1,5 @@
 """Control Yeelight bluetooth lamp."""
+
 import logging
 
 from homeassistant.components.bluetooth import (
@@ -21,7 +22,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
 
     # Find ble device here so that we can raise device not found on startup
-    address = entry.data.get(CONF_MAC)
+    address = entry.data[CONF_MAC]
 
     # try to get ble_device using HA scanner first
     ble_device = async_ble_device_from_address(hass, address.upper(), connectable=True)
@@ -46,10 +47,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.debug("async unload entry")
-    unload_ok = await hass.config_entries.async_forward_entry_unload(entry, "light")
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, ["light"])
 
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
-        if not hass.config_entries.async_entries(DOMAIN):
+        if not hass.data[DOMAIN]:
             hass.data.pop(DOMAIN)
     return unload_ok

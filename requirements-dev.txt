@@ -5,3 +5,5 @@ black
 mypy
 flake8
 isort
+pytest>=9.0
+pytest-asyncio>=1.0

@@ -1,4 +1,4 @@
-""" Constants """
+"""Constants"""
 
 # Component constants
 

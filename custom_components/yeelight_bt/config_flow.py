@@ -1,4 +1,5 @@
 """Config flow for yeelight_bt"""
+
 from __future__ import annotations
 
 import logging
@@ -8,16 +9,14 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
-    async_get_scanner,
+    async_discovered_service_info,
 )
-from homeassistant.components.bluetooth import BluetoothScanningMode
-from habluetooth.scanner import create_bleak_scanner
 from homeassistant.const import CONF_MAC, CONF_NAME
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import device_registry as dr
 
 from .const import CONF_ENTRY_MANUAL, CONF_ENTRY_METHOD, CONF_ENTRY_SCAN, DOMAIN
-from .yeelightbt import BleakError, discover_yeelight_lamps, model_from_name
+from .yeelightbt import MODEL_UNKNOWN, model_from_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -70,33 +69,19 @@ class Yeelight_btConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # type: 
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Handle the discovery by scanning."""
-        errors = {}
         if user_input is None:
             return self.async_show_form(step_id="scan")
-        scanner = async_get_scanner(self.hass)
-        _LOGGER.debug("Preparing for a scan")
-        # first we check if scanner from HA bluetooth is enabled
-        try:
-            if len(scanner.discovered_devices) >= 1:
-                # raises Attribute errors if bluetooth not configured
-                _LOGGER.debug(f"Using HA scanner {scanner}")
-        except AttributeError:
-            scanner = create_bleak_scanner(BluetoothScanningMode.ACTIVE, None)
-            _LOGGER.debug("Using bleak scanner through HA")
-        try:
-            _LOGGER.debug("Starting a scan for Yeelight Bt devices")
-            ble_devices = await discover_yeelight_lamps(scanner)
-        except BleakError as err:
-            _LOGGER.error(f"Bluetooth connection error while trying to scan: {err}")
-            errors["base"] = "BleakError"
-            return self.async_show_form(step_id="scan", errors=errors)
-
-        if not ble_devices:
-            return self.async_abort(reason="no_devices_found")
+        # Use HA's shared discovery history, including connectable proxies.
+        # Creating a local scanner here bypasses proxies and competes for BLE.
+        configured = self._async_current_ids()
         self.devices = [
-            f"{dev['ble_device'].address} ({dev['model']})" for dev in ble_devices
+            f"{info.address} ({model_from_name(info.name)})"
+            for info in async_discovered_service_info(self.hass, connectable=True)
+            if model_from_name(info.name) != MODEL_UNKNOWN
+            and dr.format_mac(info.address) not in configured
         ]
-        # TODO: filter existing devices ?
+        if not self.devices:
+            return self.async_abort(reason="no_devices_found")
 
         return await self.async_step_device()
 

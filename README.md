@@ -1,3 +1,15 @@
+> **Local stability work for Home Assistant 2026.9+**
+>
+> This checkout includes a Candela/ESPHome notification compatibility fix,
+> serialized Bluetooth operations, bounded recovery, and regression tests.
+> See [the implementation review](docs/STABILITY_REVIEW.md) for the protocol,
+> defects, changes, and remaining hardware validation. It retains actual state
+> feedback; it does not assume successful pairing or replace feedback with the
+> last requested state. The notification fix has not yet been tested on a physical
+> Candela. Local BlueZ Candela compatibility remains limited.
+>
+> The release/install notes below describe historical published versions.
+
 > **Warning**
 > The bluetooth landscape in HA is currently evolving and at the moment there still seem to be some issues with Candela.
 > Current status:
