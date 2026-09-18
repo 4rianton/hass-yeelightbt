@@ -155,6 +155,13 @@ class YeelightBT(LightEntity):
 
     @callback
     def _status_cb(self) -> None:
+        _LOGGER.debug(
+            "%s: HA state callback on=%s brightness=%s available=%s",
+            self.name,
+            self._dev.is_on,
+            self._dev.brightness,
+            self._dev.available,
+        )
         if self.hass is not None and not self._removed:
             self.async_write_ha_state()
 
@@ -175,6 +182,13 @@ class YeelightBT(LightEntity):
                 self._update_failed = False
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        _LOGGER.debug(
+            "%s: HA turn_on request brightness=%r hs=%r kelvin=%r",
+            self.name,
+            kwargs.get(ATTR_BRIGHTNESS),
+            kwargs.get(ATTR_HS_COLOR),
+            kwargs.get(ATTR_COLOR_TEMP_KELVIN),
+        )
         async with self._command_lock:
             try:
                 if kwargs.get(ATTR_BRIGHTNESS) == 0:
@@ -187,6 +201,9 @@ class YeelightBT(LightEntity):
                     max(1, round(kwargs[ATTR_BRIGHTNESS] * 100 / 255))
                     if ATTR_BRIGHTNESS in kwargs
                     else (self._dev.brightness or 100)
+                )
+                _LOGGER.debug(
+                    "%s: HA turn_on resolved brightness=%s/100", self.name, brightness
                 )
                 if (
                     ATTR_HS_COLOR in kwargs
