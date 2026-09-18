@@ -183,28 +183,6 @@ async def test_concurrent_operations_connect_once(device, connect_peer):
     await lamp.close()
 
 
-async def test_brightness_burst_sends_only_latest_queued_value(device, connect_peer):
-    peer = FakeClient()
-    connect_peer(peer)
-    lamp = protocol.Lamp(device)
-    await lamp.connect()
-
-    # Hold the operation gate while HomeKit delivers several slider updates.
-    await lamp._operation_lock.acquire()
-    first = asyncio.create_task(lamp.set_brightness(70))
-    latest = asyncio.create_task(lamp.set_brightness(85))
-    await asyncio.sleep(0)
-    lamp._operation_lock.release()
-    await asyncio.gather(first, latest)
-
-    brightness_writes = [
-        bits[2] for bits, _ in peer.writes if bits[1] == protocol.CMD_BRIGHTNESS
-    ]
-    assert brightness_writes == [85]
-    assert lamp.brightness == 85
-    await lamp.close()
-
-
 async def test_write_failure_reconnects_using_fresh_device(device, connect_peer):
     first, second = FakeClient(), FakeClient()
     first.fail_command = protocol.CMD_BRIGHTNESS

@@ -147,9 +147,6 @@ class Lamp:
         self._notification_mode = "not subscribed"
         self._gatt_details = "not discovered"
         self._route_details = "not connected"
-        # HomeKit can send a burst while its brightness slider is dragged.
-        # Once a newer value exists, queued older brightness commands are stale.
-        self._brightness_generation = 0
 
     def _record(self, event: str) -> None:
         elapsed = asyncio.get_running_loop().time() - self._attempt_started
@@ -509,10 +506,7 @@ class Lamp:
         }
 
     async def send_cmd(
-        self,
-        bits: bytes,
-        wait_notif: float = COMMAND_SETTLE_TIME,
-        brightness_generation: int | None = None,
+        self, bits: bytes, wait_notif: float = COMMAND_SETTLE_TIME
     ) -> bool:
         """Send an absolute command, retry one failed write, then confirm state.
 
@@ -521,15 +515,6 @@ class Lamp:
         """
         async with self._operation():
             for attempt in range(2):
-                if (
-                    brightness_generation is not None
-                    and brightness_generation != self._brightness_generation
-                ):
-                    self._record(
-                        f"Skipping superseded brightness {bits[2]} "
-                        f"(latest={self._brightness_generation})"
-                    )
-                    return True
                 await self._connect()
                 try:
                     if bits[1] == CMD_GETSTATE:
@@ -563,11 +548,9 @@ class Lamp:
 
     async def set_brightness(self, brightness: int) -> None:
         brightness = min(100, max(0, int(brightness)))
-        self._brightness_generation += 1
         await self.send_cmd(
             struct.pack("BBB15x", COMMAND_STX, CMD_BRIGHTNESS, brightness),
             wait_notif=TRANSITION_SETTLE_TIME,
-            brightness_generation=self._brightness_generation,
         )
 
     async def set_temperature(self, kelvin: int, brightness: int | None = None) -> None:
