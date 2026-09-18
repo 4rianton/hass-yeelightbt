@@ -67,6 +67,29 @@ async def test_candela_state_is_valid_in_homeassistant(hass, device, connect_pee
     await entity.async_will_remove_from_hass()
 
 
+async def test_homekit_brightness_burst_uses_latest_request(hass, device, connect_peer):
+    peer = FakeClient()
+    connect_peer(peer)
+    entity = YeelightBT("Candela", device)
+    entity.add_to_platform_start(hass, make_platform(hass), None)
+    entity.entity_id = "light.candela"
+    await entity.add_to_platform_finish()
+
+    await entity._command_lock.acquire()
+    old = asyncio.create_task(entity.async_turn_on(brightness=70 * 255 // 100))
+    latest = asyncio.create_task(entity.async_turn_on(brightness=85 * 255 // 100))
+    await asyncio.sleep(0)
+    entity._command_lock.release()
+    await asyncio.gather(old, latest)
+
+    brightness_writes = [
+        bits[2] for bits, _ in peer.writes if bits[1] == CMD_BRIGHTNESS
+    ]
+    assert brightness_writes == [85]
+    assert entity.brightness == round(255 * 85 / 100)
+    await entity.async_will_remove_from_hass()
+
+
 async def test_service_failure_is_not_reported_as_success(hass, device, connect_peer):
     first, second = FakeClient(), FakeClient()
     first.fail_command = second.fail_command = CMD_BRIGHTNESS

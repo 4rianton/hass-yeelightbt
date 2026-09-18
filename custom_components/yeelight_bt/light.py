@@ -78,6 +78,7 @@ class YeelightBT(LightEntity):
         self._dev = Lamp(ble_device, device_callback=device_callback, model=model)
         self._remove_callback = self._dev.add_callback_on_state_changed(self._status_cb)
         self._command_lock = asyncio.Lock()
+        self._brightness_request = 0
         self._removed = False
         self._update_failed = False
         self._prop_min_max = self._dev.get_prop_min_max()
@@ -175,7 +176,17 @@ class YeelightBT(LightEntity):
                 self._update_failed = False
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        brightness_request = None
+        if ATTR_BRIGHTNESS in kwargs:
+            self._brightness_request += 1
+            brightness_request = self._brightness_request
         async with self._command_lock:
+            if (
+                brightness_request is not None
+                and brightness_request != self._brightness_request
+            ):
+                _LOGGER.debug("%s: Skipping superseded brightness request", self.name)
+                return
             try:
                 if kwargs.get(ATTR_BRIGHTNESS) == 0:
                     await self._dev.turn_off()
